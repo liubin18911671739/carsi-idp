@@ -1,0 +1,17 @@
+# Local secrets and generated runtime state
+.env
+.env.*
+!.env.example
+credentials/
+customized/
+metadata/
+logs/
+mariadb-data/
+mariadb-init/
+nginx/certs/
+nginx/logs/
+
+# Local document renders and macOS metadata
+.DS_Store
+.docx_render*/
+.huawei_docx_render*/

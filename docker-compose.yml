@@ -1,0 +1,102 @@
+# =============================================================================
+# CARSI / Shibboleth IdP 5.2.2 单校部署
+#   镜像: cscfi/shibboleth-idp:5.2.2  (IdP 5.2.2 + Jetty 12.1.9 + 预置 jetty-base)
+#   形态: nginx(443, TLS 终止) -> idp(Jetty 8080 + backchannel 8443) -> mariadb
+#
+#   上线命令:
+#     1) cp .env.example .env && vi .env
+#     2) ./scripts/gen-credentials.sh          # 首启一次性生成签名/加密/sealer 凭据
+#     3) docker compose up -d
+#     4) docker compose logs -f idp            # 看到 "Started ServerConnector" 即成功
+#   验收: curl -kI https://localhost/idp/shibboleth
+# =============================================================================
+
+services:
+  # ───────────────────────────────────────────────────────────────────────────
+  # IdP —— 不 build，直接用官方维护镜像；配置通过 CUSTOMIZED_IDP_DIR 软链注入，
+  #        凭据通过 ./credentials 卷持久化（绝不重生成）
+  # ───────────────────────────────────────────────────────────────────────────
+  idp:
+    image: cscfi/shibboleth-idp:5.2.2
+    container_name: carsi-idp
+    restart: unless-stopped
+    hostname: ${IDP_HOSTNAME}
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # entrypoint 默认从 secrets.properties 读 JETTY_*，这里显式给出以防 missing
+      JETTY_KEYSTORE_PASSWORD: ${JETTY_KEYSTORE_PASSWORD}
+      IDP_HOME: /opt/shibboleth-idp
+      # 我们的配置注入点（entrypoint 会 cp -rsf 到 IDP_HOME，只覆盖同名文件）
+      CUSTOMIZED_IDP_DIR: /opt/idp-customized
+      # 换过凭据后需要重建 war 时才置 1（首启已 build 好的 war 通常不用）
+      FORCEBUILD: 0
+      ENABLE_SSL: ${ENABLE_SSL:-0}
+      ENABLE_SEALER: ${ENABLE_SEALER:-0}
+    volumes:
+      # —— 核心资产：凭据。首启由 scripts/gen-credentials.sh 生成，此后只读挂载 ——
+      - ./credentials:/opt/shibboleth-idp/credentials
+      # —— 我们要覆盖的配置（只放改动过的文件，避免破坏官方基线）——
+      - ./customized:/opt/idp-customized:ro
+      # —— 持久化日志与运行时元数据 ——
+      - ./logs:/opt/shibboleth-idp/logs
+      - ./metadata:/opt/shibboleth-idp/metadata
+    networks:
+      - carsi
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /idp/shibboleth HTTP/1.1\\r\\nHost: ${IDP_HOSTNAME}\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # nginx —— 公网 443 终止 TLS，反代到 idp:8080；同时代理 backchannel 8443
+  # ───────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: carsi-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"       # HTTP -> 强制跳 HTTPS（CARSI 要求）
+      - "443:443"     # 公网入口
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/logs:/var/log/nginx
+    networks:
+      - carsi
+    depends_on:
+      - idp
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # MariaDB —— 存 eptid <-> 学工号 映射（IdP storage-service / JDBC 插件）
+  # ───────────────────────────────────────────────────────────────────────────
+  mariadb:
+    image: mariadb:11.4
+    container_name: carsi-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-ChangeMeDbRoot2026}
+      MARIADB_DATABASE: shibboleth
+      MARIADB_USER: shibboleth
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-ChangeMeDbUser2026}
+    volumes:
+      - ./mariadb-data:/var/lib/mysql
+      # 建表脚本（JDBC StorageService 需要 storage 表）
+      - ./mariadb-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - carsi
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+networks:
+  carsi:
+    driver: bridge
