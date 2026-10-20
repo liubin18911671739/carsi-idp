@@ -1,0 +1,100 @@
+services:
+  # ── Jetty 12 + Shibboleth IdP 5.2.2 ──────────────────────────────
+  idp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CARSI_PKG_BASE: ${CARSI_PKG_BASE:-https://ds.carsi.edu.cn/5.0inst/v1}
+        JETTY_VER: ${JETTY_VER:-12.1.9}
+    image: carsi-idp:5.2.2
+    container_name: carsi-idp
+    hostname: ${IDP_HOST:-idp.local}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      ENTITY_ID: ${ENTITY_ID:-https://idp.local/idp/shibboleth}
+      IDP_HOST: ${IDP_HOST:-idp.local}
+      IDP_SCOPE: ${IDP_SCOPE:-local}
+      SEALER_PASSWORD: ${SEALER_PASSWORD:?set SEALER_PASSWORD in .env}
+      DB_HOST: mariadb
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-shibboleth}
+      DB_USER: ${DB_USER:-shibboleth}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      JAVA_OPTS: ${JAVA_OPTS:--Xms512m -Xmx1024m -XX:MaxMetaspaceSize=256m -XX:+UseG1GC -Dfile.encoding=UTF-8 -Djava.awt.headless=true}
+    volumes:
+      # ── 核心资产：必须持久化，禁止随容器重建 ──
+      - ./volumes/credentials:/opt/shibboleth-idp/credentials
+      - ./volumes/metadata:/opt/shibboleth-idp/metadata
+      - ./volumes/logs:/opt/shibboleth-idp/logs
+      # ── 配置：本地覆盖官方模板（可写，便于调参）──
+      - ./conf/idp.properties:/opt/shibboleth-idp/conf/idp.properties:ro
+      - ./conf/attribute-filter.xml:/opt/shibboleth-idp/conf/attribute-filter.xml:ro
+      - ./conf/attribute-resolver.xml:/opt/shibboleth-idp/conf/attribute-resolver.xml:ro
+      - ./conf/metadata-providers.xml:/opt/shibboleth-idp/conf/metadata-providers.xml:ro
+    expose:
+      - "8080"
+    networks:
+      - carsi
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    # 容器时间与宿主一致是 SAML 的硬要求
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── TLS 终止 + 反向代理 ─────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: carsi-nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./conf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./volumes/certs:/etc/nginx/certs:ro
+      - ./volumes/nginx-logs:/var/log/nginx
+    networks:
+      - carsi
+    depends_on:
+      - idp
+
+  # ── eptid ⇄ 学工号 映射存储 ─────────────────────────────────────
+  mariadb:
+    image: mariadb:10.11
+    container_name: carsi-mariadb
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+      MARIADB_DATABASE: ${DB_NAME:-shibboleth}
+      MARIADB_USER: ${DB_USER:-shibboleth}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=50
+    volumes:
+      - ./volumes/mariadb:/var/lib/mysql
+      - ./conf/mariadb/init:/docker-entrypoint-initdb.d:ro
+    expose:
+      - "3306"
+    networks:
+      - carsi
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+networks:
+  carsi:
+    driver: bridge
